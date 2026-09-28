@@ -211,3 +211,28 @@ test('threads callback: documented debug shape (no app_id) accepted', async () =
   assert.ok(body.includes('TLONG'));
   assert.ok(body.includes('threads_content_publish'));
 });
+
+test('threads debug call carries the documented TH| app-token format', async () => {
+  const { state, nonce } = await mintState('k3', 'threads');
+  let seen;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith('https://graph.threads.com/v1.0/debug_token')) { seen = u; }
+    if (u.startsWith('https://graph.threads.net/v1.0/oauth/access_token'))
+      return new Response(JSON.stringify({ access_token: 'TSHORT', user_id: '27854165164221388' }), { status: 200 });
+    if (u.startsWith('https://graph.threads.net/access_token'))
+      return new Response(JSON.stringify({ access_token: 'TLONG', token_type: 'bearer', expires_in: 1 }), { status: 200 });
+    if (u.startsWith('https://graph.threads.com/v1.0/debug_token'))
+      return new Response(JSON.stringify({ data: { type: 'USER', is_valid: true, user_id: '27854165164221388',
+        scopes: ['threads_basic', 'threads_content_publish', 'threads_read_replies', 'threads_manage_replies'] } }), { status: 200 });
+    if (u.startsWith('https://graph.threads.net/v1.0/me'))
+      return new Response(JSON.stringify({ id: '27854165164221388', username: 'ainewsil' }), { status: 200 });
+    throw new Error('unexpected fetch: ' + u);
+  };
+  await worker.fetch(new Request('https://oauth.mash.org.il/meta/threads/callback?code=c&state=' + state,
+    { headers: { cookie: 'bind_threads=' + nonce } }), FULL_ENV);
+  assert.ok(seen, 'debug_token was called');
+  const q = new URL(seen).searchParams;
+  assert.equal(q.get('access_token'), 'TH|t|ts');
+  assert.equal(q.get('input_token'), 'TLONG');
+});
