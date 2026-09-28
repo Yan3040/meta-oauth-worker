@@ -107,13 +107,13 @@ test('html responses carry no-store + no-referrer + frame-ancestors', async () =
 
 // --- /start routes: real worker.fetch, must return 302 + Location + Set-Cookie ---
 const FULL_ENV = {
-  META_APP_ID: 'm', REDIRECT_URI: 'https://oauth.mash.org.il/meta/facebook/callback',
+  META_APP_ID: 'm', META_APP_SECRET: 'ms', REDIRECT_URI: 'https://oauth.mash.org.il/meta/facebook/callback',
   TARGET_PAGE_ID: '826210657231623', STATE_SIGNING_KEY: 'k1',
-  IG_APP_ID: 'i', IG_REDIRECT_URI: 'https://oauth.mash.org.il/meta/instagram/callback',
+  IG_APP_ID: 'i', IG_APP_SECRET: 'is', IG_REDIRECT_URI: 'https://oauth.mash.org.il/meta/instagram/callback',
   IG_TARGET_ID: '27505601549079393', STATE_SIGNING_KEY_IG: 'k2',
-  THREADS_APP_ID: 't', THREADS_REDIRECT_URI: 'https://oauth.mash.org.il/meta/threads/callback',
+  THREADS_APP_ID: 't', THREADS_APP_SECRET: 'ts', THREADS_REDIRECT_URI: 'https://oauth.mash.org.il/meta/threads/callback',
   THREADS_TARGET_ID: '27854165164221388', STATE_SIGNING_KEY_THREADS: 'k3',
-  YOUTUBE_CLIENT_ID: 'y', YOUTUBE_REDIRECT_URI: 'https://oauth.mash.org.il/google/youtube/callback',
+  YOUTUBE_CLIENT_ID: 'y', YOUTUBE_CLIENT_SECRET: 'ys', YOUTUBE_REDIRECT_URI: 'https://oauth.mash.org.il/google/youtube/callback',
   YOUTUBE_CHANNEL_ID: 'c', STATE_SIGNING_KEY_YT: 'k4',
 };
 
@@ -144,4 +144,70 @@ test('threads consent no longer carries threads_delete', async () => {
   const res = await worker.fetch(new Request('https://oauth.mash.org.il/meta/threads/start'), FULL_ENV);
   const loc = decodeURIComponent(res.headers.get('location'));
   assert.ok(!loc.includes('threads_delete'), loc);
+});
+
+// --- Contract tests against the documented provider response shapes ---
+function mockFetch(routes) {
+  globalThis.fetch = async (url, opts) => {
+    for (const [prefix, body] of routes) {
+      if (String(url).startsWith(prefix))
+        return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error('unexpected fetch: ' + url);
+  };
+}
+const jsonHeaders = (r) => r.headers.get('content-type');
+
+test('instagram callback: documented data[0] shape accepted, account+scopes verified', async () => {
+  const { state, nonce } = await mintState('k2', 'instagram');
+  mockFetch([
+    ['https://api.instagram.com/oauth/access_token', { data: [{ access_token: 'SHORT', user_id: '27505601549079393',
+      permissions: 'instagram_business_basic,instagram_business_content_publish,instagram_business_manage_comments' }] }],
+    ['https://graph.instagram.com/access_token', { access_token: 'LONGTOKEN', token_type: 'bearer', expires_in: 5183944 }],
+    ['https://graph.instagram.com/me', { user_id: '27505601549079393', username: 'ainewsil' }],
+  ]);
+  const res = await worker.fetch(new Request(
+    'https://oauth.mash.org.il/meta/instagram/callback?code=c&state=' + state,
+    { headers: { cookie: 'bind_instagram=' + nonce } }), FULL_ENV);
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.ok(body.includes('LONGTOKEN'));
+  assert.ok(body.includes('ainewsil'));
+  assert.match(res.headers.getSetCookie().join(';'), /bind_instagram=; Max-Age=0/);
+});
+
+test('instagram callback: documented shape with wrong user_id rejected before exchange', async () => {
+  const { state, nonce } = await mintState('k2', 'instagram');
+  let longCalled = false;
+  globalThis.fetch = async (url) => {
+    if (String(url).startsWith('https://graph.instagram.com/access_token')) longCalled = true;
+    if (String(url).startsWith('https://api.instagram.com/oauth/access_token'))
+      return new Response(JSON.stringify({ data: [{ access_token: 'SHORT', user_id: '999', permissions: 'instagram_business_basic,instagram_business_content_publish,instagram_business_manage_comments' }] }), { status: 200 });
+    throw new Error('unexpected fetch: ' + url);
+  };
+  const res = await worker.fetch(new Request(
+    'https://oauth.mash.org.il/meta/instagram/callback?code=c&state=' + state,
+    { headers: { cookie: 'bind_instagram=' + nonce } }), FULL_ENV);
+  assert.equal(res.status, 502);
+  assert.ok((await res.text()).includes('לא תואם'));
+  assert.equal(longCalled, false);
+});
+
+test('threads callback: documented debug shape (no app_id) accepted', async () => {
+  const { state, nonce } = await mintState('k3', 'threads');
+  mockFetch([
+    ['https://graph.threads.net/v1.0/oauth/access_token', { access_token: 'TSHORT', user_id: '27854165164221388' }],
+    ['https://graph.threads.net/access_token', { access_token: 'TLONG', token_type: 'bearer', expires_in: 5183944 }],
+    ['https://graph.threads.com/v1.0/debug_token', { data: { type: 'USER', application: 'Threads API Test App',
+      is_valid: true, user_id: '27854165164221388', expires_at: 1752254132,
+      scopes: ['threads_basic', 'threads_content_publish', 'threads_read_replies', 'threads_manage_replies'] } }],
+    ['https://graph.threads.net/v1.0/me', { id: '27854165164221388', username: 'ainewsil' }],
+  ]);
+  const res = await worker.fetch(new Request(
+    'https://oauth.mash.org.il/meta/threads/callback?code=c&state=' + state,
+    { headers: { cookie: 'bind_threads=' + nonce } }), FULL_ENV);
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.ok(body.includes('TLONG'));
+  assert.ok(body.includes('threads_content_publish'));
 });
