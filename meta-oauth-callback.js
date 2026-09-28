@@ -510,10 +510,23 @@ async function youtubeCallback(env, url, request, cookieHeader) {
   const granted = new Set(String(tok.scope || "").split(" "));
   const missing = YT_SCOPES.split(" ").filter(s => !granted.has(s));
   if (missing.length) return html("scopes חסרים", "<p>חסרים scopes שהוסכם עליהם. הריצו שוב ואשרו את כולם.</p>", 502);
-  const channels = await getJSON(YT_CHANNELS + "&access_token=" + encodeURIComponent(tok.access_token)).catch(() => null);
-  const ids = channels && Array.isArray(channels.items) ? channels.items.map(x => x.id) : [];
+  // Filtered channels readback: HTTP status + Google error reason only, never
+  // token/URL/values. Distinguishes GET failure, empty list and identity mismatch
+  // (28.9: a masked catch(()=>null) made 403/API-disabled look like a mismatch).
+  const chRes = await fetch(YT_CHANNELS + "&access_token=" + encodeURIComponent(tok.access_token));
+  const chText = await chRes.text();
+  let chBody = null; try { chBody = JSON.parse(chText); } catch {}
+  const ytDiag = (extra) => esc(JSON.stringify(Object.assign({ stage: "yt-channels-readback", http_status: chRes.status }, extra), null, 2));
+  if (!chRes.ok) {
+    const reason = chBody && chBody.error && Array.isArray(chBody.error.errors) && chBody.error.errors[0]
+      ? String(chBody.error.errors[0].reason || "") : "";
+    return html("קריאת ערוצי YouTube נכשלה", "<pre>" + ytDiag({ result: "get_failed", reason }) + "</pre>", 502);
+  }
+  const ids = chBody && Array.isArray(chBody.items) ? chBody.items.map(x => x && typeof x.id === "string" ? x.id : "") : [];
+  if (ids.length === 0)
+    return html("לא נמצא ערוץ YouTube", "<pre>" + ytDiag({ result: "empty_list" }) + "</pre>", 502);
   if (ids.length !== 1 || ids[0] !== env.YOUTUBE_CHANNEL_ID)
-    return html("ערוץ לא תואם", "<p>הערוץ שאומת אינו הערוץ הממופה.</p>", 502);
+    return html("ערוץ לא תואם", "<p>הערוץ שאומת אינו הערוץ הממופה.</p><pre>" + ytDiag({ result: "identity_mismatch", channel_count: ids.length }) + "</pre>", 502);
   return oneTimeTokenPage("YouTube - refresh token מוכן",
     `הטוקן אומת (channel ${ids[0]}, readback scopes: upload+readonly).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',
