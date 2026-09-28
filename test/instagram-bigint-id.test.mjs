@@ -18,7 +18,7 @@ function stubFetch(exchangeText, meText = `{"user_id":${BIG},"username":"dr.shen
     const u = String(url);
     if (u.startsWith('https://api.instagram.com/oauth/access_token')) return rawRes(exchangeText);
     if (u.startsWith('https://graph.instagram.com/access_token')) return rawRes('{"access_token":"long","expires_in":5184000}');
-    if (u.startsWith('https://graph.instagram.com/me')) return rawRes(meText);
+    if (u.startsWith('https://graph.instagram.com/v26.0/me')) return rawRes(meText);
     throw new Error('unexpected fetch ' + u);
   };
 }

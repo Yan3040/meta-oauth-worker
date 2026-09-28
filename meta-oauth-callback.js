@@ -268,11 +268,11 @@ function losslessAtPath(text, path) {
 }
 
 // Safe mismatch diagnostics: stage, value TYPE and safe-integer status only. Never the value.
-function idDiagnostics(stage, parsedValue, losslessValue) {
-  return esc(JSON.stringify({
+function idDiagnostics(stage, parsedValue, losslessValue, extra) {
+  return esc(JSON.stringify(Object.assign({
     stage, parsed_type: typeof parsedValue,
     parsed_is_safe_integer: typeof parsedValue === "number" ? Number.isSafeInteger(parsedValue) : null,
-    lossless_used: losslessValue != null }, null, 2));
+    lossless_used: losslessValue != null }, extra || {}), null, 2));
 }
 
 // Rendered on the error page instead of the generic carrier when a stage error
@@ -415,13 +415,15 @@ async function instagramCallback(env, url, cookieHeader) {
     return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-code-exchange", entry.user_id, exchRaw === undefined ? null : exchRaw) + "</pre>", 502);
   const long = await getJSON("https://graph.instagram.com/access_token?" + new URLSearchParams({
     grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: entry.access_token }), "ig-exchange-long");
-  const meRes = await getJSONRaw("https://graph.instagram.com/me?" + new URLSearchParams({
+  // Versioned path: an unversioned /me can resolve to the legacy default API version,
+  // whose user id namespace differs from the exchange id (live mismatch 28.9).
+  const meRes = await getJSONRaw("https://graph.instagram.com/v26.0/me?" + new URLSearchParams({
     fields: "user_id,username", access_token: long.access_token }), "ig-me-readback");
   const me = meRes.data || {};
   const meRaw = losslessAtPath(meRes.text, ["user_id"]);
   const meUserId = meRaw === undefined ? String(me.user_id ?? "") : meRaw;
   if (meUserId !== String(env.IG_TARGET_ID))
-    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-me-readback", me.user_id, meRaw === undefined ? null : meRaw) + "</pre>", 502);
+    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-me-readback", me.user_id, meRaw === undefined ? null : meRaw, { matches_exchange: typeof meUserId === "string" && meUserId === exchUserId, exch_id_len: exchUserId.length, me_id_len: typeof meUserId === "string" ? meUserId.length : null }) + "</pre>", 502);
   return oneTimeTokenPage("Instagram - טוקן חדש מוכן",
     `הטוקן אומת (IG @${me.username} user_id ${esc(String(meUserId))}; readback permissions: ${[...granted].join(", ")}; expires_in=${long.expires_in ?? "?"}s).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',

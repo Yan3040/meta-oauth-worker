@@ -164,7 +164,7 @@ test('instagram callback: documented data[0] shape accepted, account+scopes veri
     ['https://api.instagram.com/oauth/access_token', { data: [{ access_token: 'SHORT', user_id: '27505601549079393',
       permissions: 'instagram_business_basic,instagram_business_content_publish,instagram_business_manage_comments' }] }],
     ['https://graph.instagram.com/access_token', { access_token: 'LONGTOKEN', token_type: 'bearer', expires_in: 5183944 }],
-    ['https://graph.instagram.com/me', { user_id: '27505601549079393', username: 'ainewsil' }],
+    ['https://graph.instagram.com/v26.0/me', { user_id: '27505601549079393', username: 'ainewsil' }],
   ]);
   const res = await worker.fetch(new Request(
     'https://oauth.mash.org.il/meta/instagram/callback?code=c&state=' + state,
