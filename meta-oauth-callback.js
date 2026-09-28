@@ -241,21 +241,27 @@ async function instagramCallback(env, url, cookieHeader) {
   const code = url.searchParams.get("code");
   if (!code || !(await checkState(env.STATE_SIGNING_KEY_IG, "instagram", url.searchParams.get("state"), cookieHeader)))
     return badState("/meta/instagram");
-  const short = await postForm("https://api.instagram.com/oauth/access_token", {
+  // Official response shape: {"data": [{"access_token", "user_id",
+  // "permissions": "comma,separated,string"}]} - unwrap before use.
+  const raw = await postForm("https://api.instagram.com/oauth/access_token", {
     client_id: env.IG_APP_ID, client_secret: env.IG_APP_SECRET,
     grant_type: "authorization_code", redirect_uri: env.IG_REDIRECT_URI, code });
-  const granted = new Set(short.permissions || []);
+  const entry = raw && Array.isArray(raw.data) && raw.data.length === 1 ? raw.data[0] : null;
+  if (!entry || !entry.access_token) throw new Error("provider-shape");
+  const granted = new Set(String(entry.permissions || "").split(",").map(x => x.trim()).filter(Boolean));
   const missing = IG_SCOPES.split(",").filter(s => !granted.has(s));
   if (missing.length) return html("scopes חסרים", "<pre>" + esc(JSON.stringify({
-    granted_scopes: short.permissions, missing_scopes: missing }, null, 2)) + "</p>", 502);
+    granted_scopes: [...granted], missing_scopes: missing }, null, 2)) + "</p>", 502);
+  if (String(entry.user_id) !== String(env.IG_TARGET_ID))
+    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
   const long = await getJSON("https://graph.instagram.com/access_token?" + new URLSearchParams({
-    grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: short.access_token }));
+    grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: entry.access_token }));
   const me = await getJSON("https://graph.instagram.com/me?" + new URLSearchParams({
     fields: "user_id,username", access_token: long.access_token }));
   if (String(me.user_id) !== String(env.IG_TARGET_ID))
     return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
   return oneTimeTokenPage("Instagram - טוקן חדש מוכן",
-    `הטוקן אומת (IG @${me.username} user_id ${me.user_id}; readback permissions: ${(short.permissions || []).join(", ")}; expires_in=${long.expires_in ?? "?"}s).`,
+    `הטוקן אומת (IG @${me.username} user_id ${me.user_id}; readback permissions: ${[...granted].join(", ")}; expires_in=${long.expires_in ?? "?"}s).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',
     "Long-lived Instagram token", long.access_token);
 }
@@ -273,14 +279,18 @@ async function threadsCallback(env, url, cookieHeader) {
   const t2 = await getJSON(`${THREADS_GRAPH.replace("/v1.0", "")}/access_token?` + new URLSearchParams({
     grant_type: "th_exchange_token", client_secret: env.THREADS_APP_SECRET, access_token: t1.access_token }));
   // Scope readback on the granted token itself (not the consent request).
-  // Threads debug endpoint: graph.threads.com/v1.0/debug_token (official docs).
+  // Official Threads debug endpoint: graph.threads.com/v1.0/debug_token, called with
+  // the app access token (<APP_ID>|<APP_SECRET>) or a tester token. App binding is
+  // enforced BY THE ENDPOINT: it only inspects tokens belonging to the calling app
+  // ("The App_id in the input_token did not match the Viewing App" otherwise), and
+  // its response carries application/user_id/is_valid/scopes - no app_id field.
   const dbg = await getJSON("https://graph.threads.com/v1.0/debug_token?" + new URLSearchParams({
     input_token: t2.access_token, access_token: `${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }));
   const d = dbg.data || {};
   const missing = THREADS_SCOPES.split(",").filter(s => !(d.scopes || []).includes(s));
-  if (d.is_valid !== true || String(d.app_id) !== String(env.THREADS_APP_ID) || missing.length)
+  if (d.is_valid !== true || String(d.user_id || "") !== String(env.THREADS_TARGET_ID) || missing.length)
     return html("אימות הטוקן נכשל", "<pre>" + esc(JSON.stringify({
-      is_valid: d.is_valid, app_id_matches: String(d.app_id) === String(env.THREADS_APP_ID),
+      is_valid: d.is_valid, user_id_matches: String(d.user_id || "") === String(env.THREADS_TARGET_ID),
       granted_scopes: d.scopes, missing_scopes: missing }, null, 2)) + "</p>", 502);
   const me = await getJSON(`${THREADS_GRAPH}/me?` + new URLSearchParams({
     fields: "id,username", access_token: t2.access_token }));
