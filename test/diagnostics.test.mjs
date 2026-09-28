@@ -1,45 +1,44 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { _structureOf as structureOf, _httpInfo as httpInfo, _ProviderStageError as ProviderStageError } from '../meta-oauth-callback.js';
+import { _httpInfo as httpInfo, _ProviderStageError as ProviderStageError, _providerDiagnostic as providerDiagnostic } from '../meta-oauth-callback.js';
 
-test('structureOf reports key names and shapes, never values', () => {
-  const body = { access_token: 'SECRET-TOKEN-VALUE', user_id: 27505601549079393, permissions: 'a,b' };
-  const s = structureOf(body);
-  const flat = JSON.stringify(s);
-  assert.deepEqual(s, { access_token: 'string', user_id: 'number', permissions: 'string' });
-  assert.ok(!flat.includes('SECRET-TOKEN-VALUE'));
-  assert.ok(!flat.includes('27505601549079393'));
-  assert.ok(!flat.includes('a,b'));
+const SECRETISH = 'sk-live-SECRET-VALUE-12345';
+
+test('httpInfo keeps status + numeric codes only', () => {
+  const info = httpInfo(400, { error: { message: SECRETISH, type: SECRETISH, code: 190, error_subcode: 463 } });
+  assert.deepEqual(info, { status: 400, code: 190, subcode: 463 });
+  assert.ok(!JSON.stringify(info).includes(SECRETISH));
 });
 
-test('structureOf unwraps the IG data envelope structurally', () => {
-  const s = structureOf({ data: [{ access_token: 'x'.repeat(40), user_id: 1 }] });
-  assert.equal(s.data.arrayLength, 1);
-  assert.deepEqual(s.data.entry, { access_token: 'string', user_id: 'number' });
-});
-
-test('httpInfo keeps status, numeric codes, type; drops messages and secrets', () => {
-  const body = { error: { message: 'Invalid OAuth access token SECRET', type: 'OAuthException', code: 190, error_subcode: 463 } };
+test('httpInfo drops secret-looking keys, string types, and cardinality', () => {
+  const body = { [SECRETISH]: 'x', error: { code: '190', type: SECRETISH, status: SECRETISH, data: [1, 2, 3] } };
   const info = httpInfo(400, body);
-  assert.equal(info.status, 400);
-  assert.equal(info.code, 190);
-  assert.equal(info.subcode, 463);
-  assert.equal(info.type, 'OAuthException');
-  assert.ok(!JSON.stringify(info).includes('SECRET'));
-  assert.ok(!('message' in info));
+  assert.deepEqual(info, { status: 400 }); // string "190" rejected: integers only
+  assert.ok(!JSON.stringify(info).includes(SECRETISH));
+  assert.ok(!JSON.stringify(info).includes('data'));
 });
 
-test('httpInfo handles legacy IG error shape and non-json bodies', () => {
-  const legacy = httpInfo(400, { error_type: 'OAuthException', code: 400, error_message: 'bad SECRET' });
-  assert.equal(legacy.type, 'OAuthException');
-  assert.equal(legacy.code, 400);
-  assert.ok(!JSON.stringify(legacy).includes('SECRET'));
-  const nonJson = httpInfo(502, null);
-  assert.equal(nonJson.structure, 'non-json');
+test('httpInfo handles legacy IG shape and non-json bodies without reflection', () => {
+  const legacy = httpInfo(400, { error_type: SECRETISH, code: 400, error_message: SECRETISH });
+  assert.deepEqual(legacy, { status: 400, code: 400 });
+  assert.deepEqual(httpInfo(502, null), { status: 502 });
+});
+
+test('diagnostic page renders stage + numeric codes and nothing injectable', async () => {
+  const e = new ProviderStageError('ig-code-exchange', { status: 400, code: 190, subcode: 463 });
+  const res = providerDiagnostic(e);
+  assert.equal(res.status, 502);
+  const text = await res.text();
+  assert.ok(text.includes('ig-code-exchange'));
+  assert.ok(text.includes('400') && text.includes('190') && text.includes('463'));
+  // An attacker-controlled body that reached httpInfo must not appear
+  const evil = new ProviderStageError('ig-code-exchange', httpInfo(400, { error: { message: SECRETISH, type: SECRETISH, code: 190 } }));
+  const page2 = await providerDiagnostic(evil).text();
+  assert.ok(!page2.includes(SECRETISH));
 });
 
 test('ProviderStageError carries stage + info only', () => {
-  const e = new ProviderStageError('ig-code-exchange', { status: 400, code: 190 });
-  assert.equal(e.stage, 'ig-code-exchange');
-  assert.equal(e.info.code, 190);
+  const e = new ProviderStageError('ig-code-exchange-shape', {});
+  assert.equal(e.stage, 'ig-code-exchange-shape');
+  assert.deepEqual(e.info, {});
 });
