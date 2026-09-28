@@ -104,3 +104,44 @@ test('html responses carry no-store + no-referrer + frame-ancestors', async () =
   assert.equal(res2.headers.get('cache-control'), 'no-store');
   assert.equal(res2.headers.get('referrer-policy'), 'no-referrer');
 });
+
+// --- /start routes: real worker.fetch, must return 302 + Location + Set-Cookie ---
+const FULL_ENV = {
+  META_APP_ID: 'm', REDIRECT_URI: 'https://oauth.mash.org.il/meta/facebook/callback',
+  TARGET_PAGE_ID: '826210657231623', STATE_SIGNING_KEY: 'k1',
+  IG_APP_ID: 'i', IG_REDIRECT_URI: 'https://oauth.mash.org.il/meta/instagram/callback',
+  IG_TARGET_ID: '27505601549079393', STATE_SIGNING_KEY_IG: 'k2',
+  THREADS_APP_ID: 't', THREADS_REDIRECT_URI: 'https://oauth.mash.org.il/meta/threads/callback',
+  THREADS_TARGET_ID: '27854165164221388', STATE_SIGNING_KEY_THREADS: 'k3',
+  YOUTUBE_CLIENT_ID: 'y', YOUTUBE_REDIRECT_URI: 'https://oauth.mash.org.il/google/youtube/callback',
+  YOUTUBE_CHANNEL_ID: 'c', STATE_SIGNING_KEY_YT: 'k4',
+};
+
+const START_CASES = [
+  ['/meta/facebook/start', 'www.facebook.com', 'bind_facebook', 'pages_manage_posts'],
+  ['/meta/instagram/start', 'www.instagram.com', 'bind_instagram', 'instagram_business_content_publish'],
+  ['/meta/threads/start', 'www.threads.net', 'bind_threads', 'threads_content_publish'],
+  ['/google/youtube/start', 'accounts.google.com', 'bind_youtube', 'youtube.upload'],
+];
+for (const [path, host, cookieName, scopeBit] of START_CASES) {
+  test('start ' + path + ' -> 302 + Location + Set-Cookie', async () => {
+    const res = await worker.fetch(new Request('https://oauth.mash.org.il' + path), FULL_ENV);
+    assert.equal(res.status, 302);
+    const loc = res.headers.get('location');
+    assert.ok(loc && new URL(loc).hostname === host, loc);
+    assert.ok(decodeURIComponent(loc).includes(scopeBit), loc);
+    assert.ok(new URL(loc).searchParams.get('state'), loc);
+    const cookies = res.headers.getSetCookie().join(';');
+    assert.match(cookies, new RegExp(cookieName + '=[0-9a-f]{32}'));
+    assert.match(cookies, /HttpOnly; Secure; SameSite=Lax/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+    if (path === '/google/youtube/start') assert.match(cookies, /yt_pkce=[0-9a-f]{96}/);
+  });
+}
+
+test('threads consent no longer carries threads_delete', async () => {
+  const res = await worker.fetch(new Request('https://oauth.mash.org.il/meta/threads/start'), FULL_ENV);
+  const loc = decodeURIComponent(res.headers.get('location'));
+  assert.ok(!loc.includes('threads_delete'), loc);
+});
