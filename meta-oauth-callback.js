@@ -280,12 +280,13 @@ async function threadsCallback(env, url, cookieHeader) {
     grant_type: "th_exchange_token", client_secret: env.THREADS_APP_SECRET, access_token: t1.access_token }));
   // Scope readback on the granted token itself (not the consent request).
   // Official Threads debug endpoint: graph.threads.com/v1.0/debug_token, called with
-  // the app access token (<APP_ID>|<APP_SECRET>) or a tester token. App binding is
+  // the app access token in the documented Threads format TH|<APP_ID>|<APP_SECRET>
+  // (or a tester token). App binding is
   // enforced BY THE ENDPOINT: it only inspects tokens belonging to the calling app
   // ("The App_id in the input_token did not match the Viewing App" otherwise), and
   // its response carries application/user_id/is_valid/scopes - no app_id field.
   const dbg = await getJSON("https://graph.threads.com/v1.0/debug_token?" + new URLSearchParams({
-    input_token: t2.access_token, access_token: `${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }));
+    input_token: t2.access_token, access_token: `TH|${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }));
   const d = dbg.data || {};
   const missing = THREADS_SCOPES.split(",").filter(s => !(d.scopes || []).includes(s));
   if (d.is_valid !== true || String(d.user_id || "") !== String(env.THREADS_TARGET_ID) || missing.length)
