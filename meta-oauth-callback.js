@@ -124,19 +124,69 @@ export async function checkState(secret, provider, state, cookieHeader) {
   return bound !== null && constEq(bound, nonce);
 }
 
-// Provider error bodies are never surfaced: fixed generic carrier only.
-async function getJSON(url) {
+// Sanitized provider-failure diagnostics. Carries ONLY: stage label, HTTP status,
+// provider error code/subcode/type, and the response's field STRUCTURE (key names
+// and container shapes). Never values, messages, auth codes, tokens, app secrets,
+// or URLs.
+class ProviderStageError extends Error {
+  constructor(stage, info) {
+    super("provider-stage-" + stage);
+    this.stage = stage;
+    this.info = info;
+  }
+}
+
+// Key names and container shapes only - values are never read into the output.
+function structureOf(v, depth = 0) {
+  if (v === null || v === undefined) return "null";
+  if (Array.isArray(v)) return depth >= 2 ? "array(" + v.length + ")" : { arrayLength: v.length, entry: v.length ? structureOf(v[0], depth + 1) : "empty" };
+  if (typeof v === "object") { const o = {}; for (const k of Object.keys(v)) o[k] = structureOf(v[k], depth + 1); return o; }
+  return typeof v;
+}
+
+// Meta/IG shape: {error:{code,error_subcode,type}}; Google shape: {error:{code,status}};
+// legacy IG shape: {error_type, code}. Numeric codes only; message strings dropped.
+function httpInfo(status, body) {
+  const info = { status, structure: body === null ? "non-json" : structureOf(body) };
+  const e = body && typeof body === "object" ? (body.error && typeof body.error === "object" ? body.error : body) : null;
+  if (e) {
+    if (typeof e.code === "number" || typeof e.error_code === "number") info.code = e.code ?? e.error_code;
+    if (typeof e.error_subcode === "number") info.subcode = e.error_subcode;
+    if (typeof e.type === "string") info.type = e.type;
+    else if (typeof e.error_type === "string") info.type = e.error_type;
+    else if (typeof e.status === "string") info.type = e.status;
+  }
+  return info;
+}
+
+async function getJSON(url, stage) {
   const res = await fetch(url);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error("provider-http-" + res.status);
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new ProviderStageError(stage || "get", httpInfo(res.status, body));
   return body;
 }
 
-async function postForm(url, fields) {
+async function postForm(url, fields, stage) {
   const res = await fetch(url, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(fields) });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error("provider-http-" + res.status);
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new ProviderStageError(stage || "post", httpInfo(res.status, body));
   return body;
+}
+
+// Rendered on the error page instead of the generic carrier when a stage error
+// reaches terminal(): stage + HTTP status + error code + field structure only.
+function providerDiagnostic(err) {
+  const d = {
+    stage: err.stage,
+    http_status: err.info.status ?? null,
+    error_code: err.info.code ?? null,
+    error_subcode: err.info.subcode ?? null,
+    error_type: err.info.type ?? null,
+    response_structure: err.info.structure ?? null,
+  };
+  return html("שגיאת ספק - אבחון",
+    "<p>הספק החזיר שגיאה. אבחון מסונן (בלי קוד הרשאה, טוקן, סוד אפליקציה או כתובת מלאה) - צלמו ושלחו ל-Instinct:</p><pre>" +
+    esc(JSON.stringify(d, null, 2)) + "</pre>", 502);
 }
 
 function oneTimeTokenPage(title, verifyLine, vaultNote, tokenLabel, tokenValue) {
@@ -171,7 +221,7 @@ async function terminal(provider, extraCookieClears, fn) {
   try {
     res = await fn();
   } catch (e) {
-    res = providerError();
+    res = e instanceof ProviderStageError ? providerDiagnostic(e) : providerError();
   }
   for (const c of [...clearCookies(provider), ...extraCookieClears]) res.headers.append("set-cookie", c);
   return res;
@@ -191,16 +241,16 @@ async function metaStart(env, provider, appId, redirectUri, scopes, stateKey) {
 
 async function metaLongLivedUserToken(appId, appSecret, redirectUri, code) {
   const t1 = await getJSON(`${GRAPH}/oauth/access_token?` + new URLSearchParams({
-    client_id: appId, redirect_uri: redirectUri, client_secret: appSecret, code }));
+    client_id: appId, redirect_uri: redirectUri, client_secret: appSecret, code }), "fb-code-exchange");
   const t2 = await getJSON(`${GRAPH}/oauth/access_token?` + new URLSearchParams({
     grant_type: "fb_exchange_token", client_id: appId,
-    client_secret: appSecret, fb_exchange_token: t1.access_token }));
+    client_secret: appSecret, fb_exchange_token: t1.access_token }), "fb-exchange-long");
   return t2.access_token;
 }
 
 async function debugToken(appId, appSecret, inputToken) {
   const dbg = await getJSON(`${GRAPH}/debug_token?` + new URLSearchParams({
-    input_token: inputToken, access_token: `${appId}|${appSecret}` }));
+    input_token: inputToken, access_token: `${appId}|${appSecret}` }), "fb-debug-token");
   return dbg.data || {};
 }
 
@@ -211,7 +261,7 @@ async function facebookCallback(env, url, cookieHeader) {
     return badState("/meta/facebook");
   const userToken = await metaLongLivedUserToken(env.META_APP_ID, env.META_APP_SECRET, env.REDIRECT_URI, code);
   const accounts = await getJSON(`${GRAPH}/me/accounts?` + new URLSearchParams({
-    fields: "id,name,access_token", limit: "100", access_token: userToken }));
+    fields: "id,name,access_token", limit: "100", access_token: userToken }), "fb-me-accounts");
   const page = (accounts.data || []).find(p => p.id === env.TARGET_PAGE_ID);
   if (!page) return html("העמוד לא נבחר",
     "<p>עמוד IIAI (826210657231623) לא נמצא בין העמודים שהוענקו. הריצו שוב את הקישור וסמנו את העמוד.</p>", 400);
@@ -244,9 +294,10 @@ async function instagramCallback(env, url, cookieHeader) {
   // "permissions": "comma,separated,string"}]} - unwrap before use.
   const raw = await postForm("https://api.instagram.com/oauth/access_token", {
     client_id: env.IG_APP_ID, client_secret: env.IG_APP_SECRET,
-    grant_type: "authorization_code", redirect_uri: env.IG_REDIRECT_URI, code });
+    grant_type: "authorization_code", redirect_uri: env.IG_REDIRECT_URI, code }, "ig-code-exchange");
   const entry = raw && Array.isArray(raw.data) && raw.data.length === 1 ? raw.data[0] : null;
-  if (!entry || !entry.access_token) throw new Error("provider-shape");
+  if (!entry || !entry.access_token)
+    throw new ProviderStageError("ig-code-exchange-shape", { structure: structureOf(raw) });
   const granted = new Set(String(entry.permissions || "").split(",").map(x => x.trim()).filter(Boolean));
   const missing = IG_SCOPES.split(",").filter(s => !granted.has(s));
   if (missing.length) return html("scopes חסרים", "<pre>" + esc(JSON.stringify({
@@ -254,9 +305,9 @@ async function instagramCallback(env, url, cookieHeader) {
   if (String(entry.user_id) !== String(env.IG_TARGET_ID))
     return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
   const long = await getJSON("https://graph.instagram.com/access_token?" + new URLSearchParams({
-    grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: entry.access_token }));
+    grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: entry.access_token }), "ig-exchange-long");
   const me = await getJSON("https://graph.instagram.com/me?" + new URLSearchParams({
-    fields: "user_id,username", access_token: long.access_token }));
+    fields: "user_id,username", access_token: long.access_token }), "ig-me-readback");
   if (String(me.user_id) !== String(env.IG_TARGET_ID))
     return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
   return oneTimeTokenPage("Instagram - טוקן חדש מוכן",
@@ -274,9 +325,9 @@ async function threadsCallback(env, url, cookieHeader) {
     return badState("/meta/threads");
   const t1 = await postForm(`${THREADS_GRAPH}/oauth/access_token`, {
     client_id: env.THREADS_APP_ID, redirect_uri: env.THREADS_REDIRECT_URI,
-    client_secret: env.THREADS_APP_SECRET, code, grant_type: "authorization_code" });
+    client_secret: env.THREADS_APP_SECRET, code, grant_type: "authorization_code" }, "th-code-exchange");
   const t2 = await getJSON(`${THREADS_GRAPH.replace("/v1.0", "")}/access_token?` + new URLSearchParams({
-    grant_type: "th_exchange_token", client_secret: env.THREADS_APP_SECRET, access_token: t1.access_token }));
+    grant_type: "th_exchange_token", client_secret: env.THREADS_APP_SECRET, access_token: t1.access_token }), "th-exchange-long");
   // Scope readback on the granted token itself (not the consent request).
   // Official Threads debug endpoint: graph.threads.com/v1.0/debug_token, called with
   // the app access token in the documented Threads format TH|<APP_ID>|<APP_SECRET>
@@ -285,7 +336,7 @@ async function threadsCallback(env, url, cookieHeader) {
   // ("The App_id in the input_token did not match the Viewing App" otherwise), and
   // its response carries application/user_id/is_valid/scopes - no app_id field.
   const dbg = await getJSON("https://graph.threads.com/v1.0/debug_token?" + new URLSearchParams({
-    input_token: t2.access_token, access_token: `TH|${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }));
+    input_token: t2.access_token, access_token: `TH|${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }), "th-debug-token");
   const d = dbg.data || {};
   const missing = THREADS_SCOPES.split(",").filter(s => !(d.scopes || []).includes(s));
   if (d.is_valid !== true || String(d.user_id || "") !== String(env.THREADS_TARGET_ID) || missing.length)
@@ -293,7 +344,7 @@ async function threadsCallback(env, url, cookieHeader) {
       is_valid: d.is_valid, user_id_matches: String(d.user_id || "") === String(env.THREADS_TARGET_ID),
       granted_scopes: d.scopes, missing_scopes: missing }, null, 2)) + "</p>", 502);
   const me = await getJSON(`${THREADS_GRAPH}/me?` + new URLSearchParams({
-    fields: "id,username", access_token: t2.access_token }));
+    fields: "id,username", access_token: t2.access_token }), "th-me-readback");
   if (String(me.id) !== String(env.THREADS_TARGET_ID))
     return html("חשבון Threads לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
   return oneTimeTokenPage("Threads - טוקן חדש מוכן",
@@ -332,7 +383,7 @@ async function youtubeCallback(env, url, request, cookieHeader) {
   if (!verifier) return html("PKCE חסר", "<p>עוגיית ה-PKCE חסרה או פגה. התחילו מחדש מ-/google/youtube/start.</p>", 400);
   const tok = await postForm(GOOGLE_TOKEN, {
     client_id: env.YOUTUBE_CLIENT_ID, client_secret: env.YOUTUBE_CLIENT_SECRET, code,
-    code_verifier: verifier, grant_type: "authorization_code", redirect_uri: env.YOUTUBE_REDIRECT_URI });
+    code_verifier: verifier, grant_type: "authorization_code", redirect_uri: env.YOUTUBE_REDIRECT_URI }, "yt-code-exchange");
   if (!tok.refresh_token || !tok.access_token)
     return html("Google לא החזיר refresh token", "<p>יש להריץ שוב את /google/youtube/start (prompt=consent).</p>", 502);
   const granted = new Set(String(tok.scope || "").split(" "));
@@ -407,4 +458,4 @@ export default {
   },
 };
 
-export { mintState as _mintState, checkState as _checkState };
+export { mintState as _mintState, checkState as _checkState, structureOf as _structureOf, httpInfo as _httpInfo, ProviderStageError as _ProviderStageError };
