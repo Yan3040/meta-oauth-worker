@@ -279,13 +279,17 @@ async function instagramCallback(env, url, cookieHeader) {
   const code = url.searchParams.get("code");
   if (!code || !(await checkState(env.STATE_SIGNING_KEY_IG, "instagram", url.searchParams.get("state"), cookieHeader)))
     return badState("/meta/instagram");
-  // Official response shape: {"data": [{"access_token", "user_id",
-  // "permissions": "comma,separated,string"}]} - unwrap before use.
+  // Documented response: top-level {"access_token", "user_id",
+  // "permissions": "comma,separated,string"}. A legacy envelope {"data": [entry]}
+  // is accepted only when that is the actual shape. Live diagnosis 28.9:
+  // the real response is top-level; the envelope-only assumption was wrong.
   const raw = await postForm("https://api.instagram.com/oauth/access_token", {
     client_id: env.IG_APP_ID, client_secret: env.IG_APP_SECRET,
     grant_type: "authorization_code", redirect_uri: env.IG_REDIRECT_URI, code }, "ig-code-exchange");
-  const entry = raw && Array.isArray(raw.data) && raw.data.length === 1 ? raw.data[0] : null;
-  if (!entry || !entry.access_token) throw new ProviderStageError("ig-code-exchange-shape", {});
+  const entry = raw && typeof raw.access_token === "string" ? raw
+    : raw && Array.isArray(raw.data) && raw.data.length === 1 ? raw.data[0] : null;
+  if (!entry || typeof entry.access_token !== "string" || !entry.access_token || entry.user_id == null)
+    throw new ProviderStageError("ig-code-exchange-shape", {});
   const granted = new Set(String(entry.permissions || "").split(",").map(x => x.trim()).filter(Boolean));
   const missing = IG_SCOPES.split(",").filter(s => !granted.has(s));
   if (missing.length) return html("scopes חסרים", "<pre>" + esc(JSON.stringify({
