@@ -35,7 +35,6 @@ const THREADS_SCOPES = "threads_basic,threads_content_publish,threads_read_repli
 const YT_SCOPES = [
   "https://www.googleapis.com/auth/youtube.upload",
   "https://www.googleapis.com/auth/youtube.readonly",
-  "https://www.googleapis.com/auth/youtube.force-ssl",
 ].join(" ");
 
 const BIND_COOKIE = { facebook: "bind_facebook", instagram: "bind_instagram", threads: "bind_threads", youtube: "bind_youtube" };
@@ -344,7 +343,7 @@ async function youtubeCallback(env, url, request, cookieHeader) {
   if (ids.length !== 1 || ids[0] !== env.YOUTUBE_CHANNEL_ID)
     return html("ערוץ לא תואם", "<p>הערוץ שאומת אינו הערוץ הממופה.</p>", 502);
   return oneTimeTokenPage("YouTube - refresh token מוכן",
-    `הטוקן אומת (channel ${ids[0]}, readback scopes: upload+readonly+force-ssl).`,
+    `הטוקן אומת (channel ${ids[0]}, readback scopes: upload+readonly).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',
     "Refresh token", tok.refresh_token);
 }
