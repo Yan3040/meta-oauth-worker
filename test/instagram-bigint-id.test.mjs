@@ -70,3 +70,38 @@ test('/me readback mismatch is diagnosed at its own stage', async () => {
   assert.match(text, /ig-me-readback/);
   assert.ok(!text.includes('27505601549070002'));
 });
+
+// --- Round 2: hostile shapes. Extraction is scoped to the exact object path;
+// a decoy user_id elsewhere or a duplicate key must fail closed (502), never 200.
+
+test('HOSTILE: decoy user_id earlier in the document does not bypass the exchange check', async () => {
+  stubFetch(`{"metadata":{"user_id":${BIG}},"data":[{"access_token":"short","user_id":27505601549070001,"permissions":"${SCOPES}"}]}`);
+  const res = await run();
+  assert.equal(res.status, 502);
+  assert.match(await res.text(), /ig-code-exchange/);
+});
+
+test('HOSTILE: duplicate user_id key at the entry fails closed', async () => {
+  stubFetch(`{"access_token":"short","user_id":${BIG},"user_id":27505601549070001,"permissions":"${SCOPES}"}`);
+  const res = await run();
+  assert.equal(res.status, 502);
+  const text = await res.text();
+  assert.match(text, /ig-code-exchange/);
+  assert.ok(!text.includes(BIG));
+});
+
+test('HOSTILE: decoy user_id nested in the /me readback does not bypass it', async () => {
+  stubFetch(`{"access_token":"short","user_id":${BIG},"permissions":"${SCOPES}"}`,
+            `{"note":{"user_id":${BIG}},"user_id":27505601549070002,"username":"other"}`);
+  const res = await run();
+  assert.equal(res.status, 502);
+  assert.match(await res.text(), /ig-me-readback/);
+});
+
+test('HOSTILE: duplicate user_id at the /me readback fails closed', async () => {
+  stubFetch(`{"access_token":"short","user_id":${BIG},"permissions":"${SCOPES}"}`,
+            `{"user_id":${BIG},"user_id":27505601549070002,"username":"other"}`);
+  const res = await run();
+  assert.equal(res.status, 502);
+  assert.match(await res.text(), /ig-me-readback/);
+});
