@@ -124,10 +124,9 @@ export async function checkState(secret, provider, state, cookieHeader) {
   return bound !== null && constEq(bound, nonce);
 }
 
-// Sanitized provider-failure diagnostics. Carries ONLY: stage label, HTTP status,
-// provider error code/subcode/type, and the response's field STRUCTURE (key names
-// and container shapes). Never values, messages, auth codes, tokens, app secrets,
-// or URLs.
+// Sanitized provider-failure diagnostics. Carries ONLY: our own stage label, the
+// HTTP status, and the provider's NUMERIC error code/subcode. Never values,
+// messages, key names, error-type strings, auth codes, tokens, app secrets, or URLs.
 class ProviderStageError extends Error {
   constructor(stage, info) {
     super("provider-stage-" + stage);
@@ -136,25 +135,17 @@ class ProviderStageError extends Error {
   }
 }
 
-// Key names and container shapes only - values are never read into the output.
-function structureOf(v, depth = 0) {
-  if (v === null || v === undefined) return "null";
-  if (Array.isArray(v)) return depth >= 2 ? "array(" + v.length + ")" : { arrayLength: v.length, entry: v.length ? structureOf(v[0], depth + 1) : "empty" };
-  if (typeof v === "object") { const o = {}; for (const k of Object.keys(v)) o[k] = structureOf(v[k], depth + 1); return o; }
-  return typeof v;
-}
-
-// Meta/IG shape: {error:{code,error_subcode,type}}; Google shape: {error:{code,status}};
-// legacy IG shape: {error_type, code}. Numeric codes only; message strings dropped.
+// Numeric codes only. Nothing provider-controlled and string-shaped is reflected:
+// no key names, no error types, no messages, no cardinality - those channels were
+// shown injectable in review. Only integers pass (res.status is client-side; the
+// provider-controlled code/subcode are admitted solely as Number.isInteger).
 function httpInfo(status, body) {
-  const info = { status, structure: body === null ? "non-json" : structureOf(body) };
+  const info = { status };
   const e = body && typeof body === "object" ? (body.error && typeof body.error === "object" ? body.error : body) : null;
   if (e) {
-    if (typeof e.code === "number" || typeof e.error_code === "number") info.code = e.code ?? e.error_code;
-    if (typeof e.error_subcode === "number") info.subcode = e.error_subcode;
-    if (typeof e.type === "string") info.type = e.type;
-    else if (typeof e.error_type === "string") info.type = e.error_type;
-    else if (typeof e.status === "string") info.type = e.status;
+    if (Number.isInteger(e.code)) info.code = e.code;
+    else if (Number.isInteger(e.error_code)) info.code = e.error_code;
+    if (Number.isInteger(e.error_subcode)) info.subcode = e.error_subcode;
   }
   return info;
 }
@@ -181,11 +172,9 @@ function providerDiagnostic(err) {
     http_status: err.info.status ?? null,
     error_code: err.info.code ?? null,
     error_subcode: err.info.subcode ?? null,
-    error_type: err.info.type ?? null,
-    response_structure: err.info.structure ?? null,
   };
   return html("שגיאת ספק - אבחון",
-    "<p>הספק החזיר שגיאה. אבחון מסונן (בלי קוד הרשאה, טוקן, סוד אפליקציה או כתובת מלאה) - צלמו ושלחו ל-Instinct:</p><pre>" +
+    "<p>הספק החזיר שגיאה. אבחון מסונן (שלב + סטטוס HTTP + קוד שגיאה נומרי בלבד; בלי קוד הרשאה, טוקן, סוד אפליקציה, שמות שדות או כתובת) - צלמו ושלחו ל-Instinct:</p><pre>" +
     esc(JSON.stringify(d, null, 2)) + "</pre>", 502);
 }
 
@@ -296,8 +285,7 @@ async function instagramCallback(env, url, cookieHeader) {
     client_id: env.IG_APP_ID, client_secret: env.IG_APP_SECRET,
     grant_type: "authorization_code", redirect_uri: env.IG_REDIRECT_URI, code }, "ig-code-exchange");
   const entry = raw && Array.isArray(raw.data) && raw.data.length === 1 ? raw.data[0] : null;
-  if (!entry || !entry.access_token)
-    throw new ProviderStageError("ig-code-exchange-shape", { structure: structureOf(raw) });
+  if (!entry || !entry.access_token) throw new ProviderStageError("ig-code-exchange-shape", {});
   const granted = new Set(String(entry.permissions || "").split(",").map(x => x.trim()).filter(Boolean));
   const missing = IG_SCOPES.split(",").filter(s => !granted.has(s));
   if (missing.length) return html("scopes חסרים", "<pre>" + esc(JSON.stringify({
@@ -458,4 +446,4 @@ export default {
   },
 };
 
-export { mintState as _mintState, checkState as _checkState, structureOf as _structureOf, httpInfo as _httpInfo, ProviderStageError as _ProviderStageError };
+export { mintState as _mintState, checkState as _checkState, httpInfo as _httpInfo, ProviderStageError as _ProviderStageError, providerDiagnostic as _providerDiagnostic };
