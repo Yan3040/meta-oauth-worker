@@ -30,8 +30,8 @@ const STATE_TTL_MS = 10 * 60 * 1000;
 const FUTURE_SKEW_MS = 60 * 1000;
 
 const FB_SCOPES = "pages_show_list,pages_read_engagement,pages_manage_posts,pages_read_user_content,pages_manage_engagement";
-const IG_SCOPES = "instagram_business_basic,instagram_business_manage_comments";
-const THREADS_SCOPES = "threads_basic,threads_read_replies,threads_manage_replies,threads_delete";
+const IG_SCOPES = "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_comments";
+const THREADS_SCOPES = "threads_basic,threads_content_publish,threads_read_replies,threads_manage_replies";
 const YT_SCOPES = [
   "https://www.googleapis.com/auth/youtube.upload",
   "https://www.googleapis.com/auth/youtube.readonly",
@@ -58,11 +58,14 @@ function html(title, body, status = 200) {
     } });
 }
 
+// Response.redirect()'s headers are IMMUTABLE (TypeError on .set in Workers/undici):
+// build the 302 explicitly so cache/referrer headers and Set-Cookie actually land.
 function noStoreRedirect(location) {
-  const res = Response.redirect(location, 302);
-  res.headers.set("cache-control", "no-store");
-  res.headers.set("referrer-policy", "no-referrer");
-  return res;
+  return new Response(null, { status: 302, headers: {
+    "location": location,
+    "cache-control": "no-store",
+    "referrer-policy": "no-referrer",
+  } });
 }
 
 async function hmacHex(secret, msg) {
@@ -227,28 +230,34 @@ async function facebookCallback(env, url, cookieHeader) {
     "Page token", page.access_token);
 }
 
+// Instagram API with Instagram Login (Business Login), per the official docs:
+//   authorize:  https://www.instagram.com/oauth/authorize
+//   code->short: POST https://api.instagram.com/oauth/access_token
+//                (response carries access_token, user_id and the GRANTED permissions)
+//   short->long: GET https://graph.instagram.com/access_token?grant_type=ig_exchange_token
+//   identity:    GET https://graph.instagram.com/me?fields=user_id,username
 async function instagramCallback(env, url, cookieHeader) {
   if (url.searchParams.get("error")) return cancelled();
   const code = url.searchParams.get("code");
   if (!code || !(await checkState(env.STATE_SIGNING_KEY_IG, "instagram", url.searchParams.get("state"), cookieHeader)))
     return badState("/meta/instagram");
-  const userToken = await metaLongLivedUserToken(env.IG_APP_ID, env.IG_APP_SECRET, env.IG_REDIRECT_URI, code);
-  const d = await debugToken(env.IG_APP_ID, env.IG_APP_SECRET, userToken);
-  const missing = IG_SCOPES.split(",").filter(s => !(d.scopes || []).includes(s));
-  let igUser = null;
-  if (d.is_valid === true && String(d.app_id) === String(env.IG_APP_ID) && missing.length === 0) {
-    const ig = await getJSON(`${GRAPH}/${env.IG_TARGET_ID}?` + new URLSearchParams({
-      fields: "id,username", access_token: userToken })).catch(() => null);
-    if (ig && String(ig.id) === String(env.IG_TARGET_ID)) igUser = ig;
-  }
-  if (!igUser) return html("אימות הטוקן נכשל", "<pre>" + esc(JSON.stringify({
-    is_valid: d.is_valid, app_id_matches: String(d.app_id) === String(env.IG_APP_ID),
-    expires_at: d.expires_at, data_access_expires_at: d.data_access_expires_at,
-    scopes: d.scopes, missing_scopes: missing }, null, 2)) + "</p>", 502);
+  const short = await postForm("https://api.instagram.com/oauth/access_token", {
+    client_id: env.IG_APP_ID, client_secret: env.IG_APP_SECRET,
+    grant_type: "authorization_code", redirect_uri: env.IG_REDIRECT_URI, code });
+  const granted = new Set(short.permissions || []);
+  const missing = IG_SCOPES.split(",").filter(s => !granted.has(s));
+  if (missing.length) return html("scopes חסרים", "<pre>" + esc(JSON.stringify({
+    granted_scopes: short.permissions, missing_scopes: missing }, null, 2)) + "</p>", 502);
+  const long = await getJSON("https://graph.instagram.com/access_token?" + new URLSearchParams({
+    grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: short.access_token }));
+  const me = await getJSON("https://graph.instagram.com/me?" + new URLSearchParams({
+    fields: "user_id,username", access_token: long.access_token }));
+  if (String(me.user_id) !== String(env.IG_TARGET_ID))
+    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
   return oneTimeTokenPage("Instagram - טוקן חדש מוכן",
-    `הטוקן אומת (app תואם, IG @${igUser.username} id ${igUser.id}, valid, scopes מלאים עפ"י readback, data_access_expires_at=${d.data_access_expires_at}).`,
+    `הטוקן אומת (IG @${me.username} user_id ${me.user_id}; readback permissions: ${(short.permissions || []).join(", ")}; expires_in=${long.expires_in ?? "?"}s).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',
-    "Long-lived user token", userToken);
+    "Long-lived Instagram token", long.access_token);
 }
 
 // --- Threads (graph.threads.net) ---
@@ -263,8 +272,11 @@ async function threadsCallback(env, url, cookieHeader) {
     client_secret: env.THREADS_APP_SECRET, code, grant_type: "authorization_code" });
   const t2 = await getJSON(`${THREADS_GRAPH.replace("/v1.0", "")}/access_token?` + new URLSearchParams({
     grant_type: "th_exchange_token", client_secret: env.THREADS_APP_SECRET, access_token: t1.access_token }));
-  // Scope readback on the granted token itself (not the consent request):
-  const d = await debugToken(env.THREADS_APP_ID, env.THREADS_APP_SECRET, t2.access_token);
+  // Scope readback on the granted token itself (not the consent request).
+  // Threads debug endpoint: graph.threads.com/v1.0/debug_token (official docs).
+  const dbg = await getJSON("https://graph.threads.com/v1.0/debug_token?" + new URLSearchParams({
+    input_token: t2.access_token, access_token: `${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }));
+  const d = dbg.data || {};
   const missing = THREADS_SCOPES.split(",").filter(s => !(d.scopes || []).includes(s));
   if (d.is_valid !== true || String(d.app_id) !== String(env.THREADS_APP_ID) || missing.length)
     return html("אימות הטוקן נכשל", "<pre>" + esc(JSON.stringify({
@@ -352,8 +364,14 @@ export default {
       if (path === "/meta/facebook/callback")
         return await terminal("facebook", [], () => facebookCallback(env, url, cookieHeader));
 
-      if (path === "/meta/instagram/start")
-        return metaStart(env, "instagram", env.IG_APP_ID, env.IG_REDIRECT_URI, IG_SCOPES, "STATE_SIGNING_KEY_IG");
+      if (path === "/meta/instagram/start") {
+        const { state, nonce } = await mintState(env.STATE_SIGNING_KEY_IG, "instagram");
+        const res = noStoreRedirect("https://www.instagram.com/oauth/authorize?" + new URLSearchParams({
+          client_id: env.IG_APP_ID, redirect_uri: env.IG_REDIRECT_URI,
+          response_type: "code", scope: IG_SCOPES, state }));
+        res.headers.append("set-cookie", bindCookie("instagram", nonce));
+        return res;
+      }
       if (path === "/meta/instagram/callback")
         return await terminal("instagram", [], () => instagramCallback(env, url, cookieHeader));
 
