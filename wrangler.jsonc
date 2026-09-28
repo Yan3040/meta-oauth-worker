@@ -4,14 +4,10 @@
   "compatibility_date": "2026-09-01",
   "workers_dev": false,
   "routes": [
-    { "pattern": "oauth.mash.org.il/meta/facebook/start", "zone_name": "mash.org.il" },
-    { "pattern": "oauth.mash.org.il/meta/facebook/callback", "zone_name": "mash.org.il" },
-    { "pattern": "oauth.mash.org.il/meta/instagram/start", "zone_name": "mash.org.il" },
-    { "pattern": "oauth.mash.org.il/meta/instagram/callback", "zone_name": "mash.org.il" },
-    { "pattern": "oauth.mash.org.il/meta/threads/start", "zone_name": "mash.org.il" },
-    { "pattern": "oauth.mash.org.il/meta/threads/callback", "zone_name": "mash.org.il" },
-    { "pattern": "oauth.mash.org.il/google/youtube/start", "zone_name": "mash.org.il" },
-    { "pattern": "oauth.mash.org.il/google/youtube/callback", "zone_name": "mash.org.il" }
+    {
+      "pattern": "oauth.mash.org.il",
+      "custom_domain": true
+    }
   ],
   "vars": {
     "META_APP_ID": "4606276736317443",
