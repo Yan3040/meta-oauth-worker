@@ -1,0 +1,15 @@
+{
+  "name": "meta-oauth-callback",
+  "main": "meta-oauth-callback.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "oauth.mash.org.il/meta/facebook/start", "zone_name": "mash.org.il" },
+    { "pattern": "oauth.mash.org.il/meta/facebook/callback", "zone_name": "mash.org.il" }
+  ],
+  "vars": {
+    "META_APP_ID": "4606276736317443",
+    "TARGET_PAGE_ID": "826210657231623",
+    "REDIRECT_URI": "https://oauth.mash.org.il/meta/facebook/callback"
+  }
+}
