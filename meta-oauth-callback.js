@@ -25,6 +25,9 @@ const GRAPH = "https://graph.facebook.com/v21.0";
 const THREADS_GRAPH = "https://graph.threads.net/v1.0";
 const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
+// Google's documented error.reason values (closed enum in the API docs). Used as
+// an allowlist so provider-controlled error text is never reflected verbatim.
+const GOOGLE_API_REASONS = new Set(["accessNotConfigured", "authError", "backendError", "badRequest", "channelNotFound", "dailyLimitExceeded", "expired", "forbidden", "insufficientPermissions", "internalError", "keyInvalid", "notFound", "quotaExceeded", "rateLimitExceeded", "required", "userRateLimitExceeded"]);
 const YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels?part=id,snippet&mine=true";
 const STATE_TTL_MS = 10 * 60 * 1000;
 const FUTURE_SKEW_MS = 60 * 1000;
@@ -518,9 +521,16 @@ async function youtubeCallback(env, url, request, cookieHeader) {
   let chBody = null; try { chBody = JSON.parse(chText); } catch {}
   const ytDiag = (extra) => esc(JSON.stringify(Object.assign({ stage: "yt-channels-readback", http_status: chRes.status }, extra), null, 2));
   if (!chRes.ok) {
-    const reason = chBody && chBody.error && Array.isArray(chBody.error.errors) && chBody.error.errors[0]
+    // Provider-controlled free text never reaches the page verbatim: only exact
+    // matches from Google's documented reason enum pass through (fixed local
+    // labels), anything else collapses to "unlisted". httpInfo precedent:
+    // provider values are numbers/labels only, never raw strings.
+    const rawReason = chBody && chBody.error && Array.isArray(chBody.error.errors) && chBody.error.errors[0]
       ? String(chBody.error.errors[0].reason || "") : "";
-    return html("קריאת ערוצי YouTube נכשלה", "<pre>" + ytDiag({ result: "get_failed", reason }) + "</pre>", 502);
+    const reason = GOOGLE_API_REASONS.has(rawReason) ? rawReason : (rawReason ? "unlisted" : "");
+    const diag = { result: "get_failed" };
+    if (reason) diag.reason = reason;
+    return html("קריאת ערוצי YouTube נכשלה", "<pre>" + ytDiag(diag) + "</pre>", 502);
   }
   const ids = chBody && Array.isArray(chBody.items) ? chBody.items.map(x => x && typeof x.id === "string" ? x.id : "") : [];
   if (ids.length === 0)
