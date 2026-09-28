@@ -3,9 +3,7 @@
 // here removes a registered redirect or revokes a grant on either side.
 //
 // Providers (isolated signed state per provider - separate keys, routes, cookies):
-//   /meta/facebook/*   - IIAI page token (existing flow; legacy state format
-//                        HMAC(key, ts.nonce) still accepted for facebook ONLY so
-//                        consents already in flight complete)
+//   /meta/facebook/*   - IIAI page token (existing flow)
 //   /meta/instagram/*  - IG business account 27505601549079393 (app 1770271414146078)
 //   /meta/threads/*    - Threads account 27854165164221388 (app 1527327988427406)
 //   /google/youtube/*  - YouTube channel UCH9pcf1_jXNQH5rYVqiyfsA (existing verified
@@ -119,13 +117,7 @@ export async function checkState(secret, provider, state, cookieHeader) {
   if (tsMs > now + FUTURE_SKEW_MS) return false;          // future timestamp
   if (now - tsMs > STATE_TTL_MS) return false;            // expired
   const expect = await hmacHex(secret, provider + "." + ts + "." + nonce);
-  let ok = constEq(expect, sig);
-  if (!ok && provider === "facebook") {
-    // Legacy accept (facebook only): the original flow signed HMAC(key, ts + "." + nonce).
-    const legacy = await hmacHex(secret, ts + "." + nonce);
-    ok = constEq(legacy, sig);
-  }
-  if (!ok) return false;
+  if (!constEq(expect, sig)) return false;
   const bound = readBindCookie(cookieHeader, provider);
   return bound !== null && constEq(bound, nonce);
 }
@@ -173,7 +165,12 @@ function providerNotConfigured() {
 // Runs a callback and clears the provider's binding cookie (plus any extra flow
 // cookies such as yt_pkce) on every terminal response.
 async function terminal(provider, extraCookieClears, fn) {
-  const res = await fn();
+  let res;
+  try {
+    res = await fn();
+  } catch (e) {
+    res = providerError();
+  }
   for (const c of [...clearCookies(provider), ...extraCookieClears]) res.headers.append("set-cookie", c);
   return res;
 }
