@@ -185,14 +185,86 @@ async function postFormRaw(url, fields, stage) {
   return { data: body, text };
 }
 
-// Extracts "<key>" as an exact string from raw JSON text (string or numeric literal),
-// before any float rounding can occur. Returns null when absent.
-function losslessField(text, key) {
-  if (typeof text !== "string") return null;
-  const str = text.match(new RegExp('"' + key + '"\\s*:\\s*"([^"]*)"'));
-  if (str) return str[1];
-  const num = text.match(new RegExp('"' + key + '"\\s*:\\s*(\\d+)'));
-  return num ? num[1] : null;
+// Lossless, path-scoped JSON field extraction. A structural scanner walks the raw
+// response text (never converting numbers to floats) and returns the literal at
+// exactly one object path - a key anywhere else in the document is never consulted.
+// Returns: exact string when found (numeric integer literal or JSON string),
+// undefined when the key is absent at that path (caller may fall back to the parsed
+// value), null when present but ambiguous (duplicate key) or a non-integer literal
+// (fail closed: the caller's compare will fail).
+function losslessAtPath(text, path) {
+  if (typeof text !== "string") return undefined;
+  const want = path.join("\u0001");
+  const hits = new Map();
+  let result;
+  let i = 0;
+  const n = text.length;
+  function skipWs() { while (i < n && " \t\n\r".includes(text[i])) i++; }
+  function readString() {
+    const start = i; i++;
+    while (i < n) {
+      const c = text[i];
+      if (c === "\\") { i += 2; continue; }
+      if (c === '"') { i++; return text.slice(start, i); }
+      i++;
+    }
+    throw new Error("unterminated string");
+  }
+  function onScalar(pathArr, raw, isString) {
+    const k = pathArr.join("\u0001");
+    const count = (hits.get(k) || 0) + 1;
+    hits.set(k, count);
+    if (k !== want) return;
+    if (count > 1) { result = null; return; } // duplicate key at the target path: fail closed
+    if (isString) { try { result = JSON.parse(raw); } catch { result = null; } }
+    else result = /^-?\d+$/.test(raw) ? raw : null; // ids must be integer literals
+  }
+  function parseValue(pathArr) {
+    skipWs();
+    const c = text[i];
+    if (c === "{") {
+      i++; skipWs();
+      if (text[i] === "}") { i++; return; }
+      while (true) {
+        skipWs();
+        if (text[i] !== '"') throw new Error("bad json");
+        const key = JSON.parse(readString());
+        skipWs();
+        if (text[i] !== ":") throw new Error("bad json");
+        i++;
+        parseValue([...pathArr, key]);
+        skipWs();
+        if (text[i] === ",") { i++; continue; }
+        if (text[i] === "}") { i++; return; }
+        throw new Error("bad json");
+      }
+    }
+    if (c === "[") {
+      i++; skipWs();
+      if (text[i] === "]") { i++; return; }
+      let idx = 0;
+      while (true) {
+        parseValue([...pathArr, String(idx)]);
+        idx++;
+        skipWs();
+        if (text[i] === ",") { i++; continue; }
+        if (text[i] === "]") { i++; return; }
+        throw new Error("bad json");
+      }
+    }
+    if (c === '"') { onScalar(pathArr, readString(), true); return; }
+    const m = text.slice(i, i + 30).match(/^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/);
+    if (!m) throw new Error("bad json");
+    onScalar(pathArr, m[0], false);
+    i += m[0].length;
+  }
+  try {
+    skipWs();
+    parseValue([]);
+    skipWs();
+    if (i !== n) return undefined;
+  } catch { return undefined; }
+  return result;
 }
 
 // Safe mismatch diagnostics: stage, value TYPE and safe-integer status only. Never the value.
@@ -330,24 +402,28 @@ async function instagramCallback(env, url, cookieHeader) {
     : raw && Array.isArray(raw.data) && raw.data.length === 1 ? raw.data[0] : null;
   if (!entry || typeof entry.access_token !== "string" || !entry.access_token || entry.user_id == null)
     throw new ProviderStageError("ig-code-exchange-shape", {});
-  // Lossless id: raw text wins over the float-rounded JSON value.
-  const exchUserId = losslessField(ex.text, "user_id") ?? String(entry.user_id);
+  // Lossless id at the exact selected entry path: a user_id anywhere else in the
+  // document is not consulted; duplicate key at the path fails closed (null).
+  const exchPath = entry === raw ? ["user_id"] : ["data", "0", "user_id"];
+  const exchRaw = losslessAtPath(ex.text, exchPath);
+  const exchUserId = exchRaw === undefined ? String(entry.user_id) : exchRaw;
   const granted = new Set(String(entry.permissions || "").split(",").map(x => x.trim()).filter(Boolean));
   const missing = IG_SCOPES.split(",").filter(s => !granted.has(s));
   if (missing.length) return html("scopes חסרים", "<pre>" + esc(JSON.stringify({
     granted_scopes: [...granted], missing_scopes: missing }, null, 2)) + "</p>", 502);
   if (exchUserId !== String(env.IG_TARGET_ID))
-    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-code-exchange", entry.user_id, losslessField(ex.text, "user_id")) + "</pre>", 502);
+    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-code-exchange", entry.user_id, exchRaw === undefined ? null : exchRaw) + "</pre>", 502);
   const long = await getJSON("https://graph.instagram.com/access_token?" + new URLSearchParams({
     grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: entry.access_token }), "ig-exchange-long");
   const meRes = await getJSONRaw("https://graph.instagram.com/me?" + new URLSearchParams({
     fields: "user_id,username", access_token: long.access_token }), "ig-me-readback");
   const me = meRes.data || {};
-  const meUserId = losslessField(meRes.text, "user_id") ?? String(me.user_id);
+  const meRaw = losslessAtPath(meRes.text, ["user_id"]);
+  const meUserId = meRaw === undefined ? String(me.user_id ?? "") : meRaw;
   if (meUserId !== String(env.IG_TARGET_ID))
-    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-me-readback", me.user_id, losslessField(meRes.text, "user_id")) + "</pre>", 502);
+    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-me-readback", me.user_id, meRaw === undefined ? null : meRaw) + "</pre>", 502);
   return oneTimeTokenPage("Instagram - טוקן חדש מוכן",
-    `הטוקן אומת (IG @${me.username} user_id ${me.user_id}; readback permissions: ${[...granted].join(", ")}; expires_in=${long.expires_in ?? "?"}s).`,
+    `הטוקן אומת (IG @${me.username} user_id ${esc(String(meUserId))}; readback permissions: ${[...granted].join(", ")}; expires_in=${long.expires_in ?? "?"}s).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',
     "Long-lived Instagram token", long.access_token);
 }
@@ -374,19 +450,24 @@ async function threadsCallback(env, url, cookieHeader) {
   const dbgRes = await getJSONRaw("https://graph.threads.com/v1.0/debug_token?" + new URLSearchParams({
     input_token: t2.access_token, access_token: `TH|${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }), "th-debug-token");
   const d = (dbgRes.data || {}).data || {};
-  // Same MAX_SAFE_INTEGER defect class as IG: the target id exceeds 2^53, read it losslessly.
-  const dbgUserId = losslessField(dbgRes.text, "user_id") ?? String(d.user_id || "");
+  // Same MAX_SAFE_INTEGER defect class as IG: the target id exceeds 2^53. Read it
+  // losslessly at the exact debug_token path (data.user_id), never first-match.
+  const dbgRaw = losslessAtPath(dbgRes.text, ["data", "user_id"]);
+  const dbgUserId = dbgRaw === undefined ? String(d.user_id || "") : dbgRaw;
   const missing = THREADS_SCOPES.split(",").filter(s => !(d.scopes || []).includes(s));
   if (d.is_valid !== true || dbgUserId !== String(env.THREADS_TARGET_ID) || missing.length)
     return html("אימות הטוקן נכשל", "<pre>" + esc(JSON.stringify({
-      is_valid: d.is_valid, user_id_matches: String(d.user_id || "") === String(env.THREADS_TARGET_ID),
+      is_valid: d.is_valid, user_id_matches: dbgUserId === String(env.THREADS_TARGET_ID),
       granted_scopes: d.scopes, missing_scopes: missing }, null, 2)) + "</p>", 502);
-  const me = await getJSON(`${THREADS_GRAPH}/me?` + new URLSearchParams({
+  const meRes = await getJSONRaw(`${THREADS_GRAPH}/me?` + new URLSearchParams({
     fields: "id,username", access_token: t2.access_token }), "th-me-readback");
-  if (String(me.id) !== String(env.THREADS_TARGET_ID))
-    return html("חשבון Threads לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
+  const me = meRes.data || {};
+  const meIdRaw = losslessAtPath(meRes.text, ["id"]);
+  const meId = meIdRaw === undefined ? String(me.id ?? "") : meIdRaw;
+  if (meId !== String(env.THREADS_TARGET_ID))
+    return html("חשבון Threads לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("threads-me-readback", me.id, meIdRaw === undefined ? null : meIdRaw) + "</pre>", 502);
   return oneTimeTokenPage("Threads - טוקן חדש מוכן",
-    `הטוקן אומת (@${me.username} id ${me.id}; readback scopes: ${(d.scopes || []).join(", ")}; expires_in=${t2.expires_in ?? "?"}s).`,
+    `הטוקן אומת (@${me.username} id ${esc(String(meId))}; readback scopes: ${(d.scopes || []).join(", ")}; expires_in=${t2.expires_in ?? "?"}s).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',
     "Long-lived token", t2.access_token);
 }
