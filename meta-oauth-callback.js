@@ -164,6 +164,45 @@ async function postForm(url, fields, stage) {
   return body;
 }
 
+// Meta ids can exceed Number.MAX_SAFE_INTEGER (e.g. 27505601549079393 > 2^53):
+// res.json() silently rounds them and strict string compares then fail on real accounts.
+// These variants keep the raw text so id fields are extracted losslessly.
+async function getJSONRaw(url, stage) {
+  const res = await fetch(url);
+  const text = await res.text();
+  let body = null;
+  try { body = JSON.parse(text); } catch {}
+  if (!res.ok) throw new ProviderStageError(stage || "get", httpInfo(res.status, body));
+  return { data: body, text };
+}
+
+async function postFormRaw(url, fields, stage) {
+  const res = await fetch(url, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(fields) });
+  const text = await res.text();
+  let body = null;
+  try { body = JSON.parse(text); } catch {}
+  if (!res.ok) throw new ProviderStageError(stage || "post", httpInfo(res.status, body));
+  return { data: body, text };
+}
+
+// Extracts "<key>" as an exact string from raw JSON text (string or numeric literal),
+// before any float rounding can occur. Returns null when absent.
+function losslessField(text, key) {
+  if (typeof text !== "string") return null;
+  const str = text.match(new RegExp('"' + key + '"\\s*:\\s*"([^"]*)"'));
+  if (str) return str[1];
+  const num = text.match(new RegExp('"' + key + '"\\s*:\\s*(\\d+)'));
+  return num ? num[1] : null;
+}
+
+// Safe mismatch diagnostics: stage, value TYPE and safe-integer status only. Never the value.
+function idDiagnostics(stage, parsedValue, losslessValue) {
+  return esc(JSON.stringify({
+    stage, parsed_type: typeof parsedValue,
+    parsed_is_safe_integer: typeof parsedValue === "number" ? Number.isSafeInteger(parsedValue) : null,
+    lossless_used: losslessValue != null }, null, 2));
+}
+
 // Rendered on the error page instead of the generic carrier when a stage error
 // reaches terminal(): stage + HTTP status + error code + field structure only.
 function providerDiagnostic(err) {
@@ -283,25 +322,30 @@ async function instagramCallback(env, url, cookieHeader) {
   // "permissions": "comma,separated,string"}. A legacy envelope {"data": [entry]}
   // is accepted only when that is the actual shape. Live diagnosis 28.9:
   // the real response is top-level; the envelope-only assumption was wrong.
-  const raw = await postForm("https://api.instagram.com/oauth/access_token", {
+  const ex = await postFormRaw("https://api.instagram.com/oauth/access_token", {
     client_id: env.IG_APP_ID, client_secret: env.IG_APP_SECRET,
     grant_type: "authorization_code", redirect_uri: env.IG_REDIRECT_URI, code }, "ig-code-exchange");
+  const raw = ex.data;
   const entry = raw && typeof raw.access_token === "string" ? raw
     : raw && Array.isArray(raw.data) && raw.data.length === 1 ? raw.data[0] : null;
   if (!entry || typeof entry.access_token !== "string" || !entry.access_token || entry.user_id == null)
     throw new ProviderStageError("ig-code-exchange-shape", {});
+  // Lossless id: raw text wins over the float-rounded JSON value.
+  const exchUserId = losslessField(ex.text, "user_id") ?? String(entry.user_id);
   const granted = new Set(String(entry.permissions || "").split(",").map(x => x.trim()).filter(Boolean));
   const missing = IG_SCOPES.split(",").filter(s => !granted.has(s));
   if (missing.length) return html("scopes חסרים", "<pre>" + esc(JSON.stringify({
     granted_scopes: [...granted], missing_scopes: missing }, null, 2)) + "</p>", 502);
-  if (String(entry.user_id) !== String(env.IG_TARGET_ID))
-    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
+  if (exchUserId !== String(env.IG_TARGET_ID))
+    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-code-exchange", entry.user_id, losslessField(ex.text, "user_id")) + "</pre>", 502);
   const long = await getJSON("https://graph.instagram.com/access_token?" + new URLSearchParams({
     grant_type: "ig_exchange_token", client_secret: env.IG_APP_SECRET, access_token: entry.access_token }), "ig-exchange-long");
-  const me = await getJSON("https://graph.instagram.com/me?" + new URLSearchParams({
+  const meRes = await getJSONRaw("https://graph.instagram.com/me?" + new URLSearchParams({
     fields: "user_id,username", access_token: long.access_token }), "ig-me-readback");
-  if (String(me.user_id) !== String(env.IG_TARGET_ID))
-    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p>", 502);
+  const me = meRes.data || {};
+  const meUserId = losslessField(meRes.text, "user_id") ?? String(me.user_id);
+  if (meUserId !== String(env.IG_TARGET_ID))
+    return html("חשבון Instagram לא תואם", "<p>החשבון שאומת אינו החשבון הממופה. הריצו שוב עם החשבון הנכון.</p><pre>" + idDiagnostics("ig-me-readback", me.user_id, losslessField(meRes.text, "user_id")) + "</pre>", 502);
   return oneTimeTokenPage("Instagram - טוקן חדש מוכן",
     `הטוקן אומת (IG @${me.username} user_id ${me.user_id}; readback permissions: ${[...granted].join(", ")}; expires_in=${long.expires_in ?? "?"}s).`,
     'העתיקו עכשיו ל-vault. הדף מוצג פעם אחת ולא נשמר.',
@@ -327,11 +371,13 @@ async function threadsCallback(env, url, cookieHeader) {
   // enforced BY THE ENDPOINT: it only inspects tokens belonging to the calling app
   // ("The App_id in the input_token did not match the Viewing App" otherwise), and
   // its response carries application/user_id/is_valid/scopes - no app_id field.
-  const dbg = await getJSON("https://graph.threads.com/v1.0/debug_token?" + new URLSearchParams({
+  const dbgRes = await getJSONRaw("https://graph.threads.com/v1.0/debug_token?" + new URLSearchParams({
     input_token: t2.access_token, access_token: `TH|${env.THREADS_APP_ID}|${env.THREADS_APP_SECRET}` }), "th-debug-token");
-  const d = dbg.data || {};
+  const d = (dbgRes.data || {}).data || {};
+  // Same MAX_SAFE_INTEGER defect class as IG: the target id exceeds 2^53, read it losslessly.
+  const dbgUserId = losslessField(dbgRes.text, "user_id") ?? String(d.user_id || "");
   const missing = THREADS_SCOPES.split(",").filter(s => !(d.scopes || []).includes(s));
-  if (d.is_valid !== true || String(d.user_id || "") !== String(env.THREADS_TARGET_ID) || missing.length)
+  if (d.is_valid !== true || dbgUserId !== String(env.THREADS_TARGET_ID) || missing.length)
     return html("אימות הטוקן נכשל", "<pre>" + esc(JSON.stringify({
       is_valid: d.is_valid, user_id_matches: String(d.user_id || "") === String(env.THREADS_TARGET_ID),
       granted_scopes: d.scopes, missing_scopes: missing }, null, 2)) + "</p>", 502);
