@@ -17,12 +17,26 @@ test('valid state + matching cookie accepted', async () => {
   assert.equal(await checkState(KEY, 'instagram', state, cookieFor('instagram', nonce)), true);
 });
 
-test('facebook legacy format accepted for facebook only', async () => {
+test('pre-deployment legacy state format rejected everywhere', async () => {
+  // The worker was never deployed with the old format: there is no live traffic
+  // and no in-flight consent to migrate (see README migration note).
   const ts = Date.now().toString(36);
   const nonce = crypto.randomBytes(16).toString('hex');
   const state = await legacySig(ts, nonce);
-  assert.equal(await checkState(KEY, 'facebook', state, cookieFor('facebook', nonce)), true);
-  assert.equal(await checkState(KEY, 'instagram', state, cookieFor('instagram', nonce)), false);
+  assert.equal(await checkState(KEY, 'facebook', state, cookieFor('facebook', nonce)), false);
+});
+
+test('callback clears binding cookie on provider failure', async () => {
+  globalThis.fetch = async () => { throw new Error('network down'); };
+  const { state, nonce } = await mintState(KEY, 'instagram');
+  const env = { IG_APP_ID: '1', IG_APP_SECRET: 's', IG_REDIRECT_URI: 'https://x/cb',
+                IG_TARGET_ID: '2', STATE_SIGNING_KEY_IG: KEY };
+  const res = await worker.fetch(
+    new Request('https://oauth.mash.org.il/meta/instagram/callback?code=c&state=' + state,
+                { headers: { cookie: cookieFor('instagram', nonce) } }), env);
+  assert.equal(res.status, 502);
+  const cleared = res.headers.getSetCookie().join(';');
+  assert.match(cleared, /bind_instagram=; Max-Age=0/);
 });
 
 test('missing state rejected', async () => {
