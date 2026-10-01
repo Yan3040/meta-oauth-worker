@@ -19,6 +19,8 @@
     "THREADS_APP_ID": "1527327988427406",
     "THREADS_TARGET_ID": "27854165164221388",
     "THREADS_REDIRECT_URI": "https://oauth.mash.org.il/meta/threads/callback",
+    "GBP_CLIENT_ID": "216606794484-pptm2u9sru96oero7qo9i6flglatr46d.apps.googleusercontent.com",
+    "GBP_REDIRECT_URI": "https://oauth.mash.org.il/google/gbp/callback",
     "YOUTUBE_CLIENT_ID": "216606794484-rllvadepg9hevrs7qrs4mjp81n633obq.apps.googleusercontent.com",
     "YOUTUBE_CHANNEL_ID": "UCH9pcf1_jXNQH5rYVqiyfsA",
     "YOUTUBE_REDIRECT_URI": "https://oauth.mash.org.il/google/youtube/callback"

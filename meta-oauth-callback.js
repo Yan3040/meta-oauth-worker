@@ -20,6 +20,7 @@
 //   IG_APP_SECRET, STATE_SIGNING_KEY_IG                 (instagram)
 //   THREADS_APP_SECRET, STATE_SIGNING_KEY_THREADS       (threads)
 //   YOUTUBE_CLIENT_SECRET, STATE_SIGNING_KEY_YT         (youtube)
+//   GBP_CLIENT_SECRET, STATE_SIGNING_KEY_GBP             (gbp)
 
 const GRAPH = "https://graph.facebook.com/v21.0";
 const THREADS_GRAPH = "https://graph.threads.net/v1.0";
@@ -40,7 +41,7 @@ const YT_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
 ].join(" ");
 
-const BIND_COOKIE = { facebook: "bind_facebook", instagram: "bind_instagram", threads: "bind_threads", youtube: "bind_youtube" };
+const BIND_COOKIE = { facebook: "bind_facebook", instagram: "bind_instagram", threads: "bind_threads", youtube: "bind_youtube", gbp: "bind_gbp" };
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -543,6 +544,73 @@ async function youtubeCallback(env, url, request, cookieHeader) {
     "Refresh token", tok.refresh_token);
 }
 
+// --- GBP: isolated Google re-consent, fixed existing iLEAD resource readback ---
+const GBP_CLIENT_ID = "216606794484-pptm2u9sru96oero7qo9i6flglatr46d.apps.googleusercontent.com";
+const GBP_REDIRECT = "https://oauth.mash.org.il/google/gbp/callback";
+const GBP_SCOPE = "https://www.googleapis.com/auth/business.manage";
+const GBP_RESOURCE = "accounts/113236961009268126526/locations/5514155164283068581/localPosts/3696915744151409203";
+const CLEAR_GBP_PKCE = "gbp_pkce=; Max-Age=0; Path=/google/gbp; HttpOnly; Secure; SameSite=Lax";
+
+// Fixed endpoints only; bearer token in header, never query string; refuse redirects.
+// Responses are bounded and only fixed errors/numeric statuses are reflected.
+async function gbpJSON(url, options, stage) {
+  const res = await fetch(url, { ...options, redirect: "error" });
+  if (!res.ok) throw new ProviderStageError(stage, { status: res.status });
+  const reader = res.body.getReader();
+  const chunks = []; let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 65536) { await reader.cancel(); throw new Error("response too large"); }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const raw = new Uint8Array(size); let offset = 0;
+  for (const chunk of chunks) { raw.set(chunk, offset); offset += chunk.byteLength; }
+  const parsed = JSON.parse(new TextDecoder().decode(raw));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid response");
+  return parsed;
+}
+
+async function gbpStart(env) {
+  const { state, nonce } = await mintState(env.STATE_SIGNING_KEY_GBP, "gbp");
+  const verifier = [...crypto.getRandomValues(new Uint8Array(48))].map(b => b.toString(16).padStart(2, "0")).join("");
+  const res = noStoreRedirect(GOOGLE_AUTH + "?" + new URLSearchParams({
+    client_id: GBP_CLIENT_ID, redirect_uri: GBP_REDIRECT, response_type: "code",
+    scope: GBP_SCOPE, access_type: "offline", prompt: "consent", state,
+    code_challenge: await pkceChallenge(verifier), code_challenge_method: "S256" }));
+  res.headers.append("set-cookie", bindCookie("gbp", nonce));
+  res.headers.append("set-cookie", `gbp_pkce=${verifier}; Max-Age=600; Path=/google/gbp; HttpOnly; Secure; SameSite=Lax`);
+  return res;
+}
+
+async function gbpCallback(env, url, cookieHeader) {
+  if (url.searchParams.get("error")) return cancelled();
+  const code = url.searchParams.get("code");
+  if (!code || !(await checkState(env.STATE_SIGNING_KEY_GBP, "gbp", url.searchParams.get("state"), cookieHeader)))
+    return badState("/google/gbp");
+  const verifier = (String(cookieHeader).match(/(?:^|;\s*)gbp_pkce=([0-9a-f]{96})(?:;|$)/) || [])[1];
+  if (!verifier) return html("PKCE חסר", "<p>התחילו מחדש מקישור ההסכמה.</p>", 400);
+  const tok = await gbpJSON(GOOGLE_TOKEN, { method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: GBP_CLIENT_ID, client_secret: env.GBP_CLIENT_SECRET,
+      code, code_verifier: verifier, grant_type: "authorization_code", redirect_uri: GBP_REDIRECT }) }, "gbp-code-exchange");
+  if (typeof tok.refresh_token !== "string" || !tok.refresh_token || typeof tok.access_token !== "string" || !tok.access_token)
+    return html("Google לא החזיר טוקן נדרש", "<p>לא נשמר דבר. התחילו מחדש ואשרו את ההסכמה.</p>", 502);
+  if (!new Set(String(tok.scope || "").split(/\s+/)).has(GBP_SCOPE))
+    return html("הרשאה חסרה", "<p>הרשאת business.manage לא הוענקה. לא נשמר דבר.</p>", 502);
+  const observed = await gbpJSON("https://mybusiness.googleapis.com/v4/" + GBP_RESOURCE,
+    { method: "GET", headers: { authorization: "Bearer " + tok.access_token } }, "gbp-ilead-readback");
+  if (observed.name !== GBP_RESOURCE)
+    return html("פרופיל iLEAD לא אומת", "<p>קריאת המשאב הממופה לא תאמה. לא נשמר דבר.</p>", 502);
+  return oneTimeTokenPage("GBP - refresh token מוכן",
+    "הרשאת business.manage והגישה למשאב iLEAD הממופה אומתו. אין כאן פרסום או הפעלת תזמון.",
+    "שמרו עכשיו בכספת GBP OAuth Refresh Token בלבד. אין לשלוח טוקן בצ'אט או בצילום מסך. הדף אינו נשמר.",
+    "Refresh token", tok.refresh_token);
+}
+
 // Required env per route; missing config -> fixed 500 page, never a thrown edge error.
 const ROUTE_ENV = {
   "/meta/facebook/start": ["META_APP_ID", "REDIRECT_URI", "STATE_SIGNING_KEY"],
@@ -551,6 +619,8 @@ const ROUTE_ENV = {
   "/meta/instagram/callback": ["IG_APP_ID", "IG_APP_SECRET", "IG_REDIRECT_URI", "IG_TARGET_ID", "STATE_SIGNING_KEY_IG"],
   "/meta/threads/start": ["THREADS_APP_ID", "THREADS_REDIRECT_URI", "STATE_SIGNING_KEY_THREADS"],
   "/meta/threads/callback": ["THREADS_APP_ID", "THREADS_APP_SECRET", "THREADS_REDIRECT_URI", "THREADS_TARGET_ID", "STATE_SIGNING_KEY_THREADS"],
+  "/google/gbp/start": ["GBP_CLIENT_ID", "GBP_REDIRECT_URI", "GBP_CLIENT_SECRET", "STATE_SIGNING_KEY_GBP"],
+  "/google/gbp/callback": ["GBP_CLIENT_ID", "GBP_REDIRECT_URI", "GBP_CLIENT_SECRET", "STATE_SIGNING_KEY_GBP"],
   "/google/youtube/start": ["YOUTUBE_CLIENT_ID", "YOUTUBE_REDIRECT_URI", "STATE_SIGNING_KEY_YT"],
   "/google/youtube/callback": ["YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REDIRECT_URI", "YOUTUBE_CHANNEL_ID", "STATE_SIGNING_KEY_YT"],
 };
@@ -563,7 +633,15 @@ export default {
     const required = ROUTE_ENV[path];
     if (!required) return new Response("not found", { status: 404, headers: { "cache-control": "no-store" } });
     if (required.some(k => !env || typeof env[k] !== "string" || !env[k])) return providerNotConfigured();
+    if (path.startsWith("/google/gbp/")) {
+      if (request.method !== "GET") return new Response("method not allowed", { status: 405, headers: { allow: "GET", "cache-control": "no-store" } });
+      if (url.origin !== "https://oauth.mash.org.il" || env.GBP_CLIENT_ID !== GBP_CLIENT_ID || env.GBP_REDIRECT_URI !== GBP_REDIRECT)
+        return providerNotConfigured();
+    }
     try {
+      if (path === "/google/gbp/start") return await gbpStart(env);
+      if (path === "/google/gbp/callback")
+        return await terminal("gbp", [CLEAR_GBP_PKCE], () => gbpCallback(env, url, cookieHeader));
       if (path === "/meta/facebook/start")
         return metaStart(env, "facebook", env.META_APP_ID, env.REDIRECT_URI, FB_SCOPES, "STATE_SIGNING_KEY");
       if (path === "/meta/facebook/callback")
